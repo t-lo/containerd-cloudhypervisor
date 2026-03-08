@@ -1,17 +1,165 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::os::unix::io::FromRawFd;
+use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use async_trait::async_trait;
+use cloudhv_proto::generated::agent::*;
+use cloudhv_proto::generated::agent_ttrpc::{self, AgentService, HealthService};
 use log::{debug, error, info};
 use tokio::signal::unix::{signal, SignalKind};
+use ttrpc::r#async::TtrpcContext;
 
 use cloudhv_common::AGENT_VSOCK_PORT;
 
 use crate::container::ContainerManager;
 
+// --- AgentService implementation ---
+
+struct AgentServiceHandler {
+    container_manager: Arc<tokio::sync::Mutex<ContainerManager>>,
+}
+
+#[async_trait]
+impl AgentService for AgentServiceHandler {
+    async fn create_container(
+        &self,
+        _ctx: &TtrpcContext,
+        req: CreateContainerRequest,
+    ) -> ttrpc::Result<CreateContainerResponse> {
+        info!("RPC: create_container id={}", req.container_id);
+        let stdout = if req.stdout.is_empty() {
+            None
+        } else {
+            Some(req.stdout.as_str())
+        };
+        let stderr = if req.stderr.is_empty() {
+            None
+        } else {
+            Some(req.stderr.as_str())
+        };
+        let mut mgr = self.container_manager.lock().await;
+        let pid = mgr
+            .create(&req.container_id, &req.bundle_path, stdout, stderr)
+            .await
+            .map_err(|e| ttrpc::Error::Others(format!("create_container failed: {e}")))?;
+        let mut resp = CreateContainerResponse::new();
+        resp.pid = pid;
+        Ok(resp)
+    }
+
+    async fn start_container(
+        &self,
+        _ctx: &TtrpcContext,
+        req: StartContainerRequest,
+    ) -> ttrpc::Result<StartContainerResponse> {
+        info!("RPC: start_container id={}", req.container_id);
+        let mut mgr = self.container_manager.lock().await;
+        let pid = mgr
+            .start(&req.container_id)
+            .await
+            .map_err(|e| ttrpc::Error::Others(format!("start_container failed: {e}")))?;
+        let mut resp = StartContainerResponse::new();
+        resp.pid = pid;
+        Ok(resp)
+    }
+
+    async fn kill_container(
+        &self,
+        _ctx: &TtrpcContext,
+        req: KillContainerRequest,
+    ) -> ttrpc::Result<KillContainerResponse> {
+        info!(
+            "RPC: kill_container id={} signal={}",
+            req.container_id, req.signal
+        );
+        let mgr = self.container_manager.lock().await;
+        mgr.kill(&req.container_id, req.signal)
+            .await
+            .map_err(|e| ttrpc::Error::Others(format!("kill_container failed: {e}")))?;
+        Ok(KillContainerResponse::new())
+    }
+
+    async fn delete_container(
+        &self,
+        _ctx: &TtrpcContext,
+        req: DeleteContainerRequest,
+    ) -> ttrpc::Result<DeleteContainerResponse> {
+        info!("RPC: delete_container id={}", req.container_id);
+        let mut mgr = self.container_manager.lock().await;
+        let (pid, exit_code) = mgr
+            .delete(&req.container_id)
+            .await
+            .map_err(|e| ttrpc::Error::Others(format!("delete_container failed: {e}")))?;
+        let mut resp = DeleteContainerResponse::new();
+        resp.pid = pid;
+        resp.exit_status = exit_code as u32;
+        Ok(resp)
+    }
+
+    async fn wait_container(
+        &self,
+        _ctx: &TtrpcContext,
+        req: WaitContainerRequest,
+    ) -> ttrpc::Result<WaitContainerResponse> {
+        info!("RPC: wait_container id={}", req.container_id);
+        let mut mgr = self.container_manager.lock().await;
+        let (exit_code, exited_at) = mgr
+            .wait(&req.container_id)
+            .await
+            .map_err(|e| ttrpc::Error::Others(format!("wait_container failed: {e}")))?;
+        let mut resp = WaitContainerResponse::new();
+        resp.exit_status = exit_code as u32;
+        resp.exited_at = exited_at;
+        Ok(resp)
+    }
+
+    async fn exec_process(
+        &self,
+        _ctx: &TtrpcContext,
+        req: ExecProcessRequest,
+    ) -> ttrpc::Result<ExecProcessResponse> {
+        info!(
+            "RPC: exec_process container={} exec_id={}",
+            req.container_id, req.exec_id
+        );
+        Err(ttrpc::Error::RpcStatus(ttrpc::get_status(
+            ttrpc::Code::UNIMPLEMENTED,
+            "exec_process not yet implemented".to_string(),
+        )))
+    }
+
+    async fn state_container(
+        &self,
+        _ctx: &TtrpcContext,
+        req: StateContainerRequest,
+    ) -> ttrpc::Result<StateContainerResponse> {
+        debug!("RPC: state_container id={}", req.container_id);
+        let mgr = self.container_manager.lock().await;
+        mgr.state(&req.container_id)
+            .await
+            .map_err(|e| ttrpc::Error::Others(format!("state_container failed: {e}")))
+    }
+}
+
+// --- HealthService implementation ---
+
+struct HealthServiceHandler;
+
+#[async_trait]
+impl HealthService for HealthServiceHandler {
+    async fn check(&self, _ctx: &TtrpcContext, _req: CheckRequest) -> ttrpc::Result<CheckResponse> {
+        let mut resp = CheckResponse::new();
+        resp.ready = true;
+        resp.version = env!("CARGO_PKG_VERSION").to_string();
+        Ok(resp)
+    }
+}
+
+// --- Server ---
+
 /// ttrpc server that listens on vsock and handles container lifecycle RPCs.
 pub struct AgentServer {
-    container_manager: Arc<Mutex<ContainerManager>>,
+    container_manager: Arc<tokio::sync::Mutex<ContainerManager>>,
 }
 
 impl Default for AgentServer {
@@ -23,7 +171,7 @@ impl Default for AgentServer {
 impl AgentServer {
     pub fn new() -> Self {
         Self {
-            container_manager: Arc::new(Mutex::new(ContainerManager::new())),
+            container_manager: Arc::new(tokio::sync::Mutex::new(ContainerManager::new())),
         }
     }
 
@@ -34,43 +182,55 @@ impl AgentServer {
             AGENT_VSOCK_PORT
         );
 
-        // Bind to vsock
-        // The guest-side vsock address is: AF_VSOCK, CID=VMADDR_CID_ANY(u32::MAX), port=10789
-        //
-        // For ttrpc, we create a listener and register our service implementations.
-        //
-        // TODO: Full ttrpc server implementation with AgentService and HealthService.
-        // For Phase 1, we'll use a simplified approach:
-        // 1. Create a vsock listener
-        // 2. Accept connections
-        // 3. Handle ttrpc-encoded requests
-        //
-        // The ttrpc crate supports async server via:
-        //   ttrpc::asynchronous::Server::new()
-        //       .register_service(agent_service)
-        //       .register_service(health_service)
-        //       .start_on_listener(listener)
-
-        let _vsock_fd = create_vsock_listener(AGENT_VSOCK_PORT)?;
+        let vsock_fd = create_vsock_listener(AGENT_VSOCK_PORT)?;
         info!("vsock listener created on port {}", AGENT_VSOCK_PORT);
 
-        // TODO: Register ttrpc services and start server
-        // For now, keep the agent alive waiting for signals
-        info!("agent ready, waiting for connections...");
+        let agent_service = Arc::new(AgentServiceHandler {
+            container_manager: self.container_manager.clone(),
+        });
+        let health_service = Arc::new(HealthServiceHandler);
 
-        // Wait for SIGTERM or SIGINT
+        let agent_svc = agent_ttrpc::create_agent_service(agent_service);
+        let health_svc = agent_ttrpc::create_health_service(health_service);
+
+        #[cfg(target_os = "linux")]
+        let mut server = {
+            unsafe {
+                ttrpc::asynchronous::Server::new()
+                    .add_vsock_listener(vsock_fd)
+                    .expect("failed to add vsock listener")
+            }
+            .register_service(agent_svc)
+            .register_service(health_svc)
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let mut server = {
+            let _ = vsock_fd;
+            ttrpc::asynchronous::Server::new()
+                .register_service(agent_svc)
+                .register_service(health_svc)
+        };
+
+        server
+            .start()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to start ttrpc server: {e}"))?;
+
+        info!("ttrpc server started, accepting connections");
+
         let mut sigterm = signal(SignalKind::terminate())?;
         let mut sigint = signal(SignalKind::interrupt())?;
 
         tokio::select! {
-            _ = sigterm.recv() => {
-                info!("received SIGTERM, shutting down");
-            }
-            _ = sigint.recv() => {
-                info!("received SIGINT, shutting down");
-            }
+            _ = sigterm.recv() => info!("received SIGTERM, shutting down"),
+            _ = sigint.recv() => info!("received SIGINT, shutting down"),
         }
 
+        server
+            .shutdown()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to shutdown ttrpc server: {e}"))?;
         info!("agent server stopped");
         Ok(())
     }
