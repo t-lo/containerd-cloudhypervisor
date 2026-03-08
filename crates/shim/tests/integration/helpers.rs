@@ -1,7 +1,4 @@
-#![allow(dead_code, unused_imports, unused_macros)]
-
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Test fixture paths, resolved from env vars or project defaults.
 pub struct TestFixtures {
@@ -9,7 +6,6 @@ pub struct TestFixtures {
     pub rootfs_path: PathBuf,
     pub ch_binary: PathBuf,
     pub virtiofsd_binary: PathBuf,
-    pub project_root: PathBuf,
 }
 
 impl TestFixtures {
@@ -37,7 +33,6 @@ impl TestFixtures {
             rootfs_path,
             ch_binary,
             virtiofsd_binary,
-            project_root,
         })
     }
 
@@ -57,8 +52,8 @@ impl TestFixtures {
         if !self.virtiofsd_binary.exists() {
             missing.push(format!("virtiofsd: {}", self.virtiofsd_binary.display()));
         }
-        if !Path::new("/dev/kvm").exists() {
-            missing.push("KVM: /dev/kvm".to_string());
+        if !Path::new("/dev/kvm").exists() && !Path::new("/dev/mshv").exists() {
+            missing.push("hypervisor: /dev/kvm or /dev/mshv".to_string());
         }
 
         missing
@@ -74,9 +69,14 @@ impl TestFixtures {
             default_vcpus: 1,
             default_memory_mb: 128,
             vsock_port: cloudhv_common::AGENT_VSOCK_PORT,
-            agent_startup_timeout_secs: 15,
-            kernel_args: "console=hvc0 root=/dev/vda rw quiet".to_string(),
+            agent_startup_timeout_secs: 30,
+            kernel_args: "console=hvc0 root=/dev/vda rw quiet init=/init".to_string(),
             debug: true,
+            pool_size: 0,
+            max_containers_per_vm: 1,
+            hotplug_memory_mb: 0,
+            hotplug_method: "acpi".to_string(),
+            tpm_enabled: false,
         }
     }
 }

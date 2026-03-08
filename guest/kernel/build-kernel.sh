@@ -45,13 +45,27 @@ if [ -f "../${CONFIG_FILE}" ]; then
     scripts/config --enable XEN
     scripts/config --enable XEN_PVH
     scripts/config --enable PVH
+    # Force-enable vsock (VSOCKETS is the base framework for VIRTIO_VSOCK)
+    scripts/config --enable VSOCKETS
+    scripts/config --enable VIRTIO_VSOCKETS
+    # PCI_MSI is required for Cloud Hypervisor's virtio-pci interrupt delivery
+    scripts/config --enable PCI_MSI
     make olddefconfig
+
+    # Verify critical configs are enabled
+    for opt in PCI_MSI VSOCKETS VIRTIO_VSOCKETS PVH; do
+        if ! grep -q "CONFIG_${opt}=y" .config; then
+            echo "ERROR: CONFIG_${opt} is not enabled!"
+            exit 1
+        fi
+    done
+    echo "Kernel config verified: PCI_MSI, VSOCKETS, VIRTIO_VSOCKETS, PVH all enabled"
 else
     echo "ERROR: Config file not found: ${CONFIG_FILE}"
     echo "Using Cloud Hypervisor's default config from the kernel tree"
     make ch_defconfig 2>/dev/null || make tinyconfig
     # Enable required options
-    scripts/config --enable VIRTIO_VSOCK
+    scripts/config --enable VIRTIO_VSOCKETS
     scripts/config --enable FUSE_FS
     scripts/config --enable VIRTIO_FS
     scripts/config --enable OVERLAY_FS

@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -32,7 +36,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings -A dead_code -A unused_imports
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   unit-test:
     name: Unit Tests
@@ -49,6 +53,9 @@ jobs:
 
       - name: Run unit tests
         run: cargo test --workspace
+
+      - name: Check benchmarks compile
+        run: cargo bench -p containerd-shim-cloudhv --bench vm_overhead --no-run
 
   build:
     name: Build (${{ matrix.target }})
@@ -150,7 +157,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: guest/kernel/vmlinux
-          key: kernel-${{ env.KERNEL_VERSION }}-${{ hashFiles('guest/kernel/configs/microvm.config') }}
+          key: kernel-${{ env.KERNEL_VERSION }}-${{ hashFiles('guest/kernel/configs/microvm.config', 'guest/kernel/build-kernel.sh') }}
 
       - name: Build guest kernel
         if: env.KVM_AVAILABLE == 'true' && steps.kernel-cache.outputs.cache-hit != 'true'
@@ -174,13 +181,18 @@ jobs:
 
       - name: Run integration tests
         if: env.KVM_AVAILABLE == 'true'
+        timeout-minutes: 10
         run: |
           sudo -E env "PATH=$PATH" \
             CLOUDHV_TEST_KERNEL="$PWD/guest/kernel/vmlinux" \
             CLOUDHV_TEST_ROOTFS="$PWD/guest/rootfs/rootfs.ext4" \
             CLOUDHV_TEST_CH_BIN="/usr/local/bin/cloud-hypervisor" \
             CLOUDHV_TEST_VFSD="/usr/libexec/virtiofsd" \
-            cargo test -p containerd-shim-cloudhv --test integration -- --nocapture
+            cargo test -p containerd-shim-cloudhv --test integration -- --nocapture --test-threads=1
+
+      - name: Fix cargo cache permissions
+        if: always()
+        run: sudo chown -R $(id -u):$(id -g) ~/.cargo/ target/ 2>/dev/null || true
 
       - name: Skip notice
         if: env.KVM_AVAILABLE != 'true'

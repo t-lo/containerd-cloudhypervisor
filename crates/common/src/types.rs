@@ -40,6 +40,27 @@ pub struct RuntimeConfig {
     /// Enable debug logging
     #[serde(default)]
     pub debug: bool,
+
+    /// Number of pre-warmed VMs in the pool (0 = no pooling)
+    #[serde(default = "default_pool_size")]
+    pub pool_size: usize,
+
+    /// Maximum containers per VM (1 = one container per VM)
+    #[serde(default = "default_max_containers_per_vm")]
+    pub max_containers_per_vm: usize,
+
+    /// Hotplug memory size in MiB (0 = no hotplug).
+    /// When set, VMs are created with this additional reservable memory.
+    #[serde(default = "default_hotplug_memory_mb")]
+    pub hotplug_memory_mb: u64,
+
+    /// Memory hotplug method: "acpi" (default) or "virtio-mem"
+    #[serde(default = "default_hotplug_method")]
+    pub hotplug_method: String,
+
+    /// Enable TPM 2.0 device (requires swtpm installed on host)
+    #[serde(default)]
+    pub tpm_enabled: bool,
 }
 
 fn default_ch_binary() -> String {
@@ -61,7 +82,19 @@ fn default_agent_timeout() -> u64 {
     crate::AGENT_STARTUP_TIMEOUT_SECS
 }
 fn default_kernel_args() -> String {
-    "console=hvc0 root=/dev/vda rw quiet".to_string()
+    "console=hvc0 root=/dev/vda rw quiet init=/init".to_string()
+}
+fn default_pool_size() -> usize {
+    crate::DEFAULT_POOL_SIZE
+}
+fn default_max_containers_per_vm() -> usize {
+    crate::DEFAULT_MAX_CONTAINERS_PER_VM
+}
+fn default_hotplug_memory_mb() -> u64 {
+    crate::DEFAULT_HOTPLUG_MEMORY_MB
+}
+fn default_hotplug_method() -> String {
+    "acpi".to_string()
 }
 
 /// Cloud Hypervisor VM configuration (JSON sent to CH API)
@@ -80,6 +113,8 @@ pub struct VmConfig {
     pub serial: Option<VmConsoleConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub console: Option<VmConsoleConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tpm: Option<VmTpm>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +140,8 @@ pub struct VmMemory {
     pub shared: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hotplug_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hotplug_method: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,4 +185,27 @@ impl VmConsoleConfig {
             mode: "Off".to_string(),
         }
     }
+}
+
+/// TPM 2.0 device configuration (requires external swtpm).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmTpm {
+    pub socket: String,
+}
+
+/// Live migration configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationConfig {
+    /// Transport URI: "unix:/path/to/socket" or "tcp:host:port"
+    pub uri: String,
+    /// Whether this is a local (same-host) migration
+    #[serde(default)]
+    pub local: bool,
+}
+
+/// Snapshot configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotConfig {
+    /// Directory to store/load snapshot files
+    pub destination_url: String,
 }

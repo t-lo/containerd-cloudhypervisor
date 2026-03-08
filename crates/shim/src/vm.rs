@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,7 +7,7 @@ use log::{debug, error, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 
 use cloudhv_common::types::*;
 use cloudhv_common::{GUEST_CID_START, RUNTIME_STATE_DIR, VIRTIOFS_TAG};
@@ -36,10 +35,14 @@ pub struct VmManager {
     virtiofsd_socket: PathBuf,
     /// Shared directory for virtio-fs.
     shared_dir: PathBuf,
+    /// Path to the swtpm socket (if TPM enabled).
+    tpm_socket: PathBuf,
     /// Cloud Hypervisor child process.
     ch_process: Option<Child>,
     /// virtiofsd child process.
     virtiofsd_process: Option<Child>,
+    /// swtpm child process (if TPM enabled).
+    swtpm_process: Option<Child>,
     /// Runtime configuration.
     config: RuntimeConfig,
 }
@@ -53,6 +56,7 @@ impl VmManager {
         let vsock_socket = state_dir.join("vsock.sock");
         let virtiofsd_socket = state_dir.join("virtiofsd.sock");
         let shared_dir = state_dir.join("shared");
+        let tpm_socket = state_dir.join("tpm.sock");
 
         info!(
             "VmManager created: vm_id={}, cid={}, state_dir={}",
@@ -69,8 +73,10 @@ impl VmManager {
             vsock_socket,
             virtiofsd_socket,
             shared_dir,
+            tpm_socket,
             ch_process: None,
             virtiofsd_process: None,
+            swtpm_process: None,
             config,
         })
     }
@@ -84,6 +90,49 @@ impl VmManager {
             })?;
         debug!("state directory prepared: {}", self.state_dir.display());
         Ok(())
+    }
+
+    /// Start swtpm for TPM 2.0 support (if enabled in config).
+    pub async fn start_swtpm(&mut self) -> Result<()> {
+        if !self.config.tpm_enabled {
+            return Ok(());
+        }
+
+        info!("starting swtpm: socket={}", self.tpm_socket.display());
+
+        let tpm_state_dir = self.state_dir.join("tpm-state");
+        tokio::fs::create_dir_all(&tpm_state_dir).await?;
+
+        let child = Command::new("swtpm")
+            .arg("socket")
+            .arg("--tpmstate")
+            .arg(format!("dir={}", tpm_state_dir.display()))
+            .arg("--ctrl")
+            .arg(format!("type=unixio,path={}", self.tpm_socket.display()))
+            .arg("--tpm2")
+            .arg("--log")
+            .arg("level=1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to spawn swtpm")?;
+
+        self.swtpm_process = Some(child);
+
+        // Wait for socket to appear
+        for _ in 0..20 {
+            if self.tpm_socket.exists() {
+                debug!("swtpm socket ready");
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        anyhow::bail!(
+            "swtpm socket did not appear at {}",
+            self.tpm_socket.display()
+        );
     }
 
     /// Start virtiofsd to serve the shared directory.
@@ -166,12 +215,27 @@ impl VmManager {
             },
             cpus: VmCpus {
                 boot_vcpus: self.config.default_vcpus,
-                max_vcpus: self.config.default_vcpus,
+                // Allow hotplug up to host CPU count (or at least boot_vcpus)
+                max_vcpus: std::cmp::max(
+                    self.config.default_vcpus,
+                    std::thread::available_parallelism()
+                        .map(|n| n.get() as u32)
+                        .unwrap_or(self.config.default_vcpus),
+                ),
             },
             memory: VmMemory {
                 size: self.config.default_memory_mb * 1024 * 1024,
                 shared: true,
-                hotplug_size: None,
+                hotplug_size: if self.config.hotplug_memory_mb > 0 {
+                    Some(self.config.hotplug_memory_mb * 1024 * 1024)
+                } else {
+                    None
+                },
+                hotplug_method: if self.config.hotplug_method == "virtio-mem" {
+                    Some("VirtioMem".to_string())
+                } else {
+                    None
+                },
             },
             disks: vec![VmDisk {
                 path: self.config.rootfs_path.clone(),
@@ -189,6 +253,13 @@ impl VmManager {
             }),
             serial: Some(VmConsoleConfig::off()),
             console: Some(VmConsoleConfig::off()),
+            tpm: if self.config.tpm_enabled {
+                Some(VmTpm {
+                    socket: self.tpm_socket.to_string_lossy().to_string(),
+                })
+            } else {
+                None
+            },
         };
 
         let config_json = serde_json::to_string(&vm_config)?;
@@ -215,56 +286,61 @@ impl VmManager {
 
     /// Wait for the guest agent to become responsive.
     pub async fn wait_for_agent(&self) -> Result<()> {
-        let timeout_duration = Duration::from_secs(self.config.agent_startup_timeout_secs);
         info!(
             "waiting for guest agent on vsock (cid={}, timeout={}s)",
             self.cid, self.config.agent_startup_timeout_secs
         );
 
-        timeout(timeout_duration, async {
-            loop {
-                // Try connecting to the vsock socket and sending a health check
-                match self.check_agent_health().await {
-                    Ok(true) => {
-                        info!("guest agent is ready");
-                        return Ok(());
-                    }
-                    Ok(false) => {
-                        debug!("agent not ready yet, retrying...");
-                    }
-                    Err(e) => {
-                        debug!("agent check failed: {}, retrying...", e);
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(self.config.agent_startup_timeout_secs);
+
+        // Poll aggressively — the guest kernel boots in ~200ms and the
+        // agent starts immediately after. Each probe uses a blocking
+        // CONNECT handshake that returns instantly when the agent is
+        // listening, or returns 0 bytes / error when it's not.
+        while tokio::time::Instant::now() < deadline {
+            if self.check_agent_health().await.unwrap_or(false) {
+                info!("guest agent is ready (cid={})", self.cid);
+                return Ok(());
             }
-        })
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "timed out waiting for guest agent after {}s",
-                self.config.agent_startup_timeout_secs
-            )
-        })?
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        anyhow::bail!(
+            "timed out waiting for guest agent after {}s",
+            self.config.agent_startup_timeout_secs
+        )
     }
 
-    /// Check if the guest agent is responding to health checks.
+    /// Check if the guest agent is responding on vsock.
+    ///
+    /// Sends a CONNECT handshake to CH's vsock socket and checks
+    /// for an "OK" response from the guest agent.
     async fn check_agent_health(&self) -> Result<bool> {
-        // Connect to the vsock host-side socket
-        // Cloud Hypervisor exposes vsock as a Unix socket at vsock_socket path
-        // The guest agent listens on AGENT_VSOCK_PORT
-        // TODO: implement ttrpc health check over vsock
-        // For now, just check if the vsock socket exists and is connectable
         if !self.vsock_socket.exists() {
             return Ok(false);
         }
-        match UnixStream::connect(&self.vsock_socket).await {
-            Ok(_stream) => {
-                // Connection succeeded — agent is likely up
-                // Full ttrpc health check will be implemented in vsock.rs
-                Ok(true)
+
+        let stream = match UnixStream::connect(&self.vsock_socket).await {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        };
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut reader, mut writer) = stream.into_split();
+        let cmd = format!("CONNECT {}\n", cloudhv_common::AGENT_VSOCK_PORT);
+        if writer.write_all(cmd.as_bytes()).await.is_err() {
+            return Ok(false);
+        }
+
+        let mut buf = [0u8; 64];
+        match tokio::time::timeout(Duration::from_secs(2), reader.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                let response = String::from_utf8_lossy(&buf[..n]);
+                Ok(response.starts_with("OK"))
             }
-            Err(_) => Ok(false),
+            _ => Ok(false),
         }
     }
 
@@ -363,6 +439,182 @@ impl VmManager {
         }
     }
 
+    /// Resize VM resources (vCPUs and/or memory) via the CH API.
+    ///
+    /// Uses PUT /api/v1/vm.resize to dynamically adjust resources.
+    /// Only works if the VM was created with hotplug_size > 0.
+    #[allow(dead_code)]
+    pub async fn resize(
+        &self,
+        desired_vcpus: Option<u32>,
+        desired_memory_bytes: Option<u64>,
+    ) -> Result<()> {
+        let mut resize_body = serde_json::Map::new();
+        if let Some(vcpus) = desired_vcpus {
+            resize_body.insert(
+                "desired_vcpus".to_string(),
+                serde_json::Value::Number(vcpus.into()),
+            );
+        }
+        if let Some(mem) = desired_memory_bytes {
+            resize_body.insert(
+                "desired_ram".to_string(),
+                serde_json::Value::Number(mem.into()),
+            );
+        }
+
+        if resize_body.is_empty() {
+            return Ok(());
+        }
+
+        let body = serde_json::to_string(&serde_json::Value::Object(resize_body))?;
+        info!("resizing VM {}: {}", self.vm_id, body);
+
+        self.api_request("PUT", "/api/v1/vm.resize", Some(&body))
+            .await
+            .context("failed to resize VM")?;
+
+        info!("VM {} resized successfully", self.vm_id);
+        Ok(())
+    }
+
+    /// Snapshot the VM state to a directory.
+    ///
+    /// The VM must be paused first. Creates config.json, memory-ranges,
+    /// and state.json in the destination directory.
+    #[allow(dead_code)]
+    pub async fn snapshot(&self, destination_dir: &Path) -> Result<()> {
+        info!(
+            "snapshotting VM {} to {}",
+            self.vm_id,
+            destination_dir.display()
+        );
+
+        // Pause the VM first
+        self.api_request("PUT", "/api/v1/vm.pause", None)
+            .await
+            .context("failed to pause VM for snapshot")?;
+
+        // Take snapshot
+        let url = format!("file://{}", destination_dir.display());
+        let body = serde_json::to_string(&serde_json::json!({
+            "destination_url": url
+        }))?;
+        self.api_request("PUT", "/api/v1/vm.snapshot", Some(&body))
+            .await
+            .context("failed to snapshot VM")?;
+
+        info!(
+            "VM {} snapshot saved to {}",
+            self.vm_id,
+            destination_dir.display()
+        );
+        Ok(())
+    }
+
+    /// Restore a VM from a snapshot directory.
+    ///
+    /// Creates a new VM from the saved state. The VM starts in a paused
+    /// state and must be resumed with resume().
+    #[allow(dead_code)]
+    pub async fn restore(api_socket: &Path, source_dir: &Path) -> Result<()> {
+        info!("restoring VM from {}", source_dir.display());
+
+        let url = format!("file://{}", source_dir.display());
+        let body = serde_json::to_string(&serde_json::json!({
+            "source_url": url
+        }))?;
+
+        // Connect to the (new) CH instance API socket and send restore
+        let mut stream = UnixStream::connect(api_socket)
+            .await
+            .context("failed to connect to CH API for restore")?;
+
+        let request = format!(
+            "PUT /api/v1/vm.restore HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = vec![0u8; 4096];
+        let n = stream.read(&mut response).await?;
+        let resp_str = String::from_utf8_lossy(&response[..n]);
+
+        if resp_str.contains("200") || resp_str.contains("204") {
+            info!("VM restored from {}", source_dir.display());
+            Ok(())
+        } else {
+            anyhow::bail!("restore failed: {resp_str}")
+        }
+    }
+
+    /// Resume a paused VM (used after snapshot or restore).
+    #[allow(dead_code)]
+    pub async fn resume(&self) -> Result<()> {
+        self.api_request("PUT", "/api/v1/vm.resume", None)
+            .await
+            .context("failed to resume VM")?;
+        info!("VM {} resumed", self.vm_id);
+        Ok(())
+    }
+
+    /// Send this VM to another Cloud Hypervisor instance via live migration.
+    ///
+    /// The destination CH must be running and have called receive_migration.
+    /// Transport: "unix:/path/to/socket" for same-host, "tcp:host:port" for remote.
+    #[allow(dead_code)]
+    pub async fn send_migration(&self, transport_uri: &str, local: bool) -> Result<()> {
+        info!("sending VM {} migration to {}", self.vm_id, transport_uri);
+
+        let mut body_map = serde_json::Map::new();
+        body_map.insert(
+            "destination_url".to_string(),
+            serde_json::Value::String(transport_uri.to_string()),
+        );
+        if local {
+            body_map.insert("local".to_string(), serde_json::Value::Bool(true));
+        }
+        let body = serde_json::to_string(&serde_json::Value::Object(body_map))?;
+
+        self.api_request("PUT", "/api/v1/vm.send-migration", Some(&body))
+            .await
+            .context("failed to send migration")?;
+
+        info!("VM {} migration sent to {}", self.vm_id, transport_uri);
+        Ok(())
+    }
+
+    /// Prepare to receive a VM via live migration.
+    #[allow(dead_code)]
+    pub async fn receive_migration(api_socket: &Path, transport_uri: &str) -> Result<()> {
+        info!("preparing to receive migration on {}", transport_uri);
+
+        let body = serde_json::to_string(&serde_json::json!({
+            "receiver_url": transport_uri
+        }))?;
+
+        let mut stream = UnixStream::connect(api_socket)
+            .await
+            .context("failed to connect to CH API for receive-migration")?;
+
+        let request = format!(
+            "PUT /api/v1/vm.receive-migration HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await?;
+
+        let mut response = vec![0u8; 4096];
+        let n = stream.read(&mut response).await?;
+        let resp_str = String::from_utf8_lossy(&response[..n]);
+
+        if resp_str.contains("200") || resp_str.contains("204") {
+            info!("VM migration received on {}", transport_uri);
+            Ok(())
+        } else {
+            anyhow::bail!("receive-migration failed: {resp_str}")
+        }
+    }
+
     /// Shutdown the VM gracefully.
     pub async fn shutdown(&mut self) -> Result<()> {
         info!("shutting down VM {}", self.vm_id);
@@ -390,6 +642,12 @@ impl VmManager {
 
         // Kill virtiofsd if still running
         if let Some(ref mut child) = self.virtiofsd_process {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+
+        // Clean up swtpm if running
+        if let Some(ref mut child) = self.swtpm_process {
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
@@ -429,8 +687,44 @@ impl VmManager {
         &self.shared_dir
     }
 
+    #[allow(dead_code)]
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
+    }
+}
+
+/// Synchronous cleanup on drop — kills child processes and removes state.
+/// This ensures VM resources are released even if the shim panics or
+/// the async cleanup path is never reached.
+impl Drop for VmManager {
+    fn drop(&mut self) {
+        // Kill child processes synchronously using their PIDs
+        for (name, proc) in [
+            ("cloud-hypervisor", &mut self.ch_process),
+            ("virtiofsd", &mut self.virtiofsd_process),
+            ("swtpm", &mut self.swtpm_process),
+        ] {
+            if let Some(child) = proc.take() {
+                let pid = child.id();
+                if let Some(pid) = pid {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGTERM);
+                    }
+                    debug!("sent SIGTERM to {} (pid={})", name, pid);
+                }
+            }
+        }
+
+        // Remove state directory
+        if self.state_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&self.state_dir) {
+                debug!(
+                    "failed to remove state dir {}: {}",
+                    self.state_dir.display(),
+                    e
+                );
+            }
+        }
     }
 }
 
