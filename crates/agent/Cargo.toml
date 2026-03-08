@@ -19,6 +19,7 @@ tokio = { workspace = true }
 # RPC
 ttrpc = { workspace = true }
 protobuf = { workspace = true }
+async-trait = "0.1"
 
 # Error handling
 anyhow = { workspace = true }

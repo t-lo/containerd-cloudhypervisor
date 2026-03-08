@@ -16,10 +16,12 @@ struct Container {
     pid: Option<u32>,
     exit_code: Option<i32>,
     state: ContainerState,
+    stdout_path: Option<PathBuf>,
+    stderr_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum ContainerState {
+pub enum ContainerState {
     Created,
     Running,
     Stopped,
@@ -47,7 +49,14 @@ impl ContainerManager {
     ///
     /// The bundle is expected at: /containers/<container_id>/
     /// which is the virtio-fs mount from the host.
-    pub async fn create(&mut self, container_id: &str, bundle_path: &str) -> Result<u32> {
+    /// If stdout/stderr paths are provided, runc output is redirected there.
+    pub async fn create(
+        &mut self,
+        container_id: &str,
+        bundle_path: &str,
+        stdout_path: Option<&str>,
+        stderr_path: Option<&str>,
+    ) -> Result<u32> {
         info!("creating container: id={}", container_id);
 
         let bundle = if bundle_path.is_empty() {
@@ -60,15 +69,43 @@ impl ContainerManager {
             anyhow::bail!("bundle path does not exist: {}", bundle.display());
         }
 
-        // runc create --bundle <path> <container_id>
+        // Set up stdout/stderr redirection
+        let stdout_file = if let Some(p) = stdout_path {
+            if !p.is_empty() {
+                Some(
+                    std::fs::File::create(p)
+                        .with_context(|| format!("failed to create stdout file: {p}"))?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let stderr_file = if let Some(p) = stderr_path {
+            if !p.is_empty() {
+                Some(
+                    std::fs::File::create(p)
+                        .with_context(|| format!("failed to create stderr file: {p}"))?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let stdout_stdio = stdout_file.map(Stdio::from).unwrap_or_else(Stdio::null);
+        let stderr_stdio = stderr_file.map(Stdio::from).unwrap_or_else(Stdio::null);
+
         let output = Command::new("runc")
             .arg("create")
             .arg("--bundle")
             .arg(&bundle)
             .arg(container_id)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(stdout_stdio)
+            .stderr(stderr_stdio)
             .output()
             .await
             .context("failed to execute runc create")?;
@@ -78,7 +115,6 @@ impl ContainerManager {
             anyhow::bail!("runc create failed: {}", stderr);
         }
 
-        // Get container PID from runc state
         let pid = self.get_container_pid(container_id).await?;
 
         let container = Container {
@@ -87,6 +123,8 @@ impl ContainerManager {
             pid: Some(pid),
             exit_code: None,
             state: ContainerState::Created,
+            stdout_path: stdout_path.map(PathBuf::from),
+            stderr_path: stderr_path.map(PathBuf::from),
         };
 
         self.containers.insert(container_id.to_string(), container);
@@ -242,5 +280,33 @@ impl ContainerManager {
             .as_object()
             .cloned()
             .context("runc state is not a JSON object")
+    }
+
+    /// Get the state of a container as a proto response.
+    pub async fn state(
+        &self,
+        container_id: &str,
+    ) -> Result<cloudhv_proto::generated::agent::StateContainerResponse> {
+        use ::protobuf::EnumOrUnknown;
+        use cloudhv_proto::generated::agent::{
+            ContainerState as ProtoState, StateContainerResponse,
+        };
+
+        let mut resp = StateContainerResponse::new();
+        resp.container_id = container_id.to_string();
+
+        if let Some(container) = self.containers.get(container_id) {
+            resp.pid = container.pid.unwrap_or(0);
+            resp.status = match container.state {
+                ContainerState::Created => EnumOrUnknown::new(ProtoState::CREATED),
+                ContainerState::Running => EnumOrUnknown::new(ProtoState::RUNNING),
+                ContainerState::Stopped => EnumOrUnknown::new(ProtoState::STOPPED),
+            };
+            resp.exit_status = container.exit_code.unwrap_or(0) as u32;
+        } else {
+            resp.status = EnumOrUnknown::new(ProtoState::UNKNOWN);
+        }
+
+        Ok(resp)
     }
 }
