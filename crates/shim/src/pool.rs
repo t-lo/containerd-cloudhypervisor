@@ -93,6 +93,7 @@ impl VmPool {
             .context("failed to create VmManager")?;
 
         vm.prepare().await.context("failed to prepare VM")?;
+        vm.start_swtpm().await.context("failed to start swtpm")?;
         vm.start_virtiofsd()
             .await
             .context("failed to start virtiofsd")?;

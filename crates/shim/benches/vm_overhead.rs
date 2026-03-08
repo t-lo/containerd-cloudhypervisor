@@ -105,6 +105,7 @@ fn bench_vm_config_serialization(c: &mut Criterion) {
         }),
         serial: Some(VmConsoleConfig::off()),
         console: Some(VmConsoleConfig::off()),
+        tpm: None,
     };
 
     group.bench_function("serialize_json", |b| {
@@ -136,6 +137,7 @@ fn bench_vm_config_serialization(c: &mut Criterion) {
             max_containers_per_vm: 4,
             hotplug_memory_mb: 512,
             hotplug_method: "virtio-mem".into(),
+            tpm_enabled: false,
         };
         b.iter(|| {
             black_box(serde_json::to_string(&rt_config).unwrap());
@@ -165,6 +167,7 @@ fn bench_cid_allocation(c: &mut Criterion) {
             max_containers_per_vm: 1,
             hotplug_memory_mb: 0,
             hotplug_method: "acpi".into(),
+            tpm_enabled: false,
         };
         let mut i = 0u64;
         b.iter(|| {
@@ -218,6 +221,7 @@ fn bench_pool_operations(c: &mut Criterion) {
             max_containers_per_vm: 4,
             hotplug_memory_mb: 256,
             hotplug_method: "virtio-mem".into(),
+            tpm_enabled: false,
         };
         b.iter(|| {
             let pool = containerd_shim_cloudhv::pool::VmPool::new(config.clone());

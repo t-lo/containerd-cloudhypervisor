@@ -67,6 +67,7 @@ impl Shim for CloudHvShim {
                 max_containers_per_vm: 1,
                 hotplug_memory_mb: 0,
                 hotplug_method: "acpi".to_string(),
+                tpm_enabled: false,
             }
         });
 

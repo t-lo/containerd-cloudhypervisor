@@ -57,6 +57,10 @@ pub struct RuntimeConfig {
     /// Memory hotplug method: "acpi" (default) or "virtio-mem"
     #[serde(default = "default_hotplug_method")]
     pub hotplug_method: String,
+
+    /// Enable TPM 2.0 device (requires swtpm installed on host)
+    #[serde(default)]
+    pub tpm_enabled: bool,
 }
 
 fn default_ch_binary() -> String {
@@ -109,6 +113,8 @@ pub struct VmConfig {
     pub serial: Option<VmConsoleConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub console: Option<VmConsoleConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tpm: Option<VmTpm>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,4 +185,27 @@ impl VmConsoleConfig {
             mode: "Off".to_string(),
         }
     }
+}
+
+/// TPM 2.0 device configuration (requires external swtpm).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmTpm {
+    pub socket: String,
+}
+
+/// Live migration configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationConfig {
+    /// Transport URI: "unix:/path/to/socket" or "tcp:host:port"
+    pub uri: String,
+    /// Whether this is a local (same-host) migration
+    #[serde(default)]
+    pub local: bool,
+}
+
+/// Snapshot configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotConfig {
+    /// Directory to store/load snapshot files
+    pub destination_url: String,
 }

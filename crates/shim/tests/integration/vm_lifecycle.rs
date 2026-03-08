@@ -195,6 +195,7 @@ fn test_vm_config_json_generation() {
             size: 128 * 1024 * 1024,
             shared: true,
             hotplug_size: None,
+            hotplug_method: None,
         },
         disks: vec![VmDisk {
             path: "/opt/rootfs.ext4".to_string(),
@@ -212,6 +213,7 @@ fn test_vm_config_json_generation() {
         }),
         serial: Some(VmConsoleConfig::off()),
         console: Some(VmConsoleConfig::off()),
+        tpm: None,
     };
 
     let json = serde_json::to_string_pretty(&config).expect("failed to serialize VM config");
@@ -402,6 +404,7 @@ fn test_vm_config_with_hotplug() {
         vsock: None,
         serial: None,
         console: None,
+        tpm: None,
     };
 
     let json = serde_json::to_string_pretty(&config).expect("failed to serialize");
@@ -725,15 +728,10 @@ fn test_e2e_container_lifecycle_benchmark() {
         // Already done by pool.create_warm_vm — measure a second connect for reference
         let phase2_start = std::time::Instant::now();
         let vsock_client = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
-        let ttrpc_ok = match tokio::time::timeout(
-            Duration::from_secs(10),
-            vsock_client.health_check(),
-        )
-        .await
-        {
-            Ok(Ok(true)) => true,
-            _ => false,
-        };
+        let ttrpc_ok = matches!(
+            tokio::time::timeout(Duration::from_secs(10), vsock_client.health_check()).await,
+            Ok(Ok(true))
+        );
         let ttrpc_connect_time = phase2_start.elapsed();
         eprintln!(
             "  Phase 2 │ ttrpc health check:            {:>9.1?} (ok={})",
