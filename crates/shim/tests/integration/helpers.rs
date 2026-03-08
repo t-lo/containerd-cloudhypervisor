@@ -75,7 +75,7 @@ impl TestFixtures {
             default_vcpus: 1,
             default_memory_mb: 128,
             vsock_port: cloudhv_common::AGENT_VSOCK_PORT,
-            agent_startup_timeout_secs: 15,
+            agent_startup_timeout_secs: 30,
             kernel_args: "console=hvc0 root=/dev/vda rw quiet".to_string(),
             debug: true,
             pool_size: 0,

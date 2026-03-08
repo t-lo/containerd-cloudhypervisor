@@ -7,7 +7,7 @@ use log::{debug, error, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 
 use cloudhv_common::types::*;
 use cloudhv_common::{GUEST_CID_START, RUNTIME_STATE_DIR, VIRTIOFS_TAG};
@@ -280,57 +280,77 @@ impl VmManager {
 
     /// Wait for the guest agent to become responsive.
     pub async fn wait_for_agent(&self) -> Result<()> {
-        let timeout_duration = Duration::from_secs(self.config.agent_startup_timeout_secs);
+        // Cloud Hypervisor's vsock Unix socket has quirky behavior with
+        // repeated CONNECT probes — failed attempts poison subsequent ones.
+        // Wait for the kernel to boot and agent to start, then verify once.
         info!(
             "waiting for guest agent on vsock (cid={}, timeout={}s)",
             self.cid, self.config.agent_startup_timeout_secs
         );
 
-        timeout(timeout_duration, async {
-            loop {
-                // Try connecting to the vsock socket and sending a health check
-                match self.check_agent_health().await {
-                    Ok(true) => {
-                        info!("guest agent is ready");
-                        return Ok(());
-                    }
-                    Ok(false) => {
-                        debug!("agent not ready yet, retrying...");
-                    }
-                    Err(e) => {
-                        debug!("agent check failed: {}, retrying...", e);
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
+        // Give the kernel time to boot and the agent to start listening.
+        // The guest boot takes ~1-2s, agent init ~0.5s.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Now probe with retries, but use a fresh connection each time
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(self.config.agent_startup_timeout_secs);
+
+        while tokio::time::Instant::now() < deadline {
+            if self.check_agent_health().await.unwrap_or(false) {
+                info!("guest agent is ready (cid={})", self.cid);
+                return Ok(());
             }
-        })
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "timed out waiting for guest agent after {}s",
-                self.config.agent_startup_timeout_secs
-            )
-        })?
+            // Wait between probes to let CH reset its vsock socket state
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+
+        anyhow::bail!(
+            "timed out waiting for guest agent after {}s",
+            self.config.agent_startup_timeout_secs
+        )
     }
 
-    /// Check if the guest agent is responding to health checks.
+    /// Check if the guest agent is responding on vsock.
+    ///
+    /// Uses std::net blocking I/O with a read timeout. Cloud Hypervisor's
+    /// vsock Unix socket doesn't work reliably with tokio's async epoll.
     async fn check_agent_health(&self) -> Result<bool> {
-        // Connect to the vsock host-side socket
-        // Cloud Hypervisor exposes vsock as a Unix socket at vsock_socket path
-        // The guest agent listens on AGENT_VSOCK_PORT
-        // TODO: implement ttrpc health check over vsock
-        // For now, just check if the vsock socket exists and is connectable
         if !self.vsock_socket.exists() {
             return Ok(false);
         }
-        match UnixStream::connect(&self.vsock_socket).await {
-            Ok(_stream) => {
-                // Connection succeeded — agent is likely up
-                // Full ttrpc health check will be implemented in vsock.rs
-                Ok(true)
+        let socket_path = self.vsock_socket.clone();
+        let port = cloudhv_common::AGENT_VSOCK_PORT;
+
+        tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+
+            let mut stream = match std::os::unix::net::UnixStream::connect(&socket_path) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            // Set a read timeout so the thread doesn't block forever
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+
+            let cmd = format!("CONNECT {port}\n");
+            if stream.write_all(cmd.as_bytes()).is_err() {
+                return false;
             }
-            Err(_) => Ok(false),
-        }
+
+            let mut buf = [0u8; 256];
+            match stream.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    let response = String::from_utf8_lossy(&buf[..n]);
+                    response.starts_with("OK")
+                }
+                _ => false, // Timeout (WouldBlock), EOF, or error
+            }
+        })
+        .await
+        .unwrap_or(false)
+        .then_some(true)
+        .ok_or_else(|| anyhow::anyhow!("agent not ready"))
+        .or(Ok(false))
     }
 
     /// Send an HTTP request to the Cloud Hypervisor API over Unix socket.

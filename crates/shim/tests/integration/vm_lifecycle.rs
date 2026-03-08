@@ -65,17 +65,12 @@ fn test_vm_boot_and_agent_health() {
 
         // Wait for agent
         eprintln!("=== Waiting for guest agent ===");
-        match tokio::time::timeout(Duration::from_secs(20), vm.wait_for_agent()).await {
-            Ok(Ok(())) => {
+        match vm.wait_for_agent().await {
+            Ok(()) => {
                 eprintln!("=== Guest agent is ready! ===");
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 eprintln!("=== Agent wait failed: {} ===", e);
-                // Don't fail the test — the basic health check is rudimentary
-                // and the agent may need full ttrpc to pass
-            }
-            Err(_) => {
-                eprintln!("=== Agent wait timed out (20s) — VM booted but agent not confirmed ===");
             }
         }
 

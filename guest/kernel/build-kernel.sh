@@ -45,6 +45,11 @@ if [ -f "../${CONFIG_FILE}" ]; then
     scripts/config --enable XEN
     scripts/config --enable XEN_PVH
     scripts/config --enable PVH
+    # Force-enable vsock (VSOCKETS is the base framework for VIRTIO_VSOCK)
+    scripts/config --enable VSOCKETS
+    scripts/config --enable VIRTIO_VSOCK
+    # PCI_MSI is required for Cloud Hypervisor's virtio-pci interrupt delivery
+    scripts/config --enable PCI_MSI
     make olddefconfig
 else
     echo "ERROR: Config file not found: ${CONFIG_FILE}"
