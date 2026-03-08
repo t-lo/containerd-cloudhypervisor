@@ -7,6 +7,8 @@ use containerd_shim::Config;
 use log::info;
 
 mod config;
+mod hypervisor;
+mod image_cache;
 mod instance;
 mod pool;
 mod vm;
@@ -21,6 +23,9 @@ async fn main() {
         "containerd-shim-cloudhv-v1 starting (version {})",
         env!("CARGO_PKG_VERSION")
     );
+
+    let backend = hypervisor::detect_hypervisor();
+    info!("hypervisor backend: {}", backend);
 
     let config = Config {
         no_reaper: false,
