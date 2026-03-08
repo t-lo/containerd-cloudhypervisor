@@ -215,7 +215,13 @@ impl VmManager {
             },
             cpus: VmCpus {
                 boot_vcpus: self.config.default_vcpus,
-                max_vcpus: std::cmp::max(self.config.default_vcpus, 4),
+                // Allow hotplug up to host CPU count (or at least boot_vcpus)
+                max_vcpus: std::cmp::max(
+                    self.config.default_vcpus,
+                    std::thread::available_parallelism()
+                        .map(|n| n.get() as u32)
+                        .unwrap_or(self.config.default_vcpus),
+                ),
             },
             memory: VmMemory {
                 size: self.config.default_memory_mb * 1024 * 1024,
@@ -280,29 +286,24 @@ impl VmManager {
 
     /// Wait for the guest agent to become responsive.
     pub async fn wait_for_agent(&self) -> Result<()> {
-        // Cloud Hypervisor's vsock Unix socket has quirky behavior with
-        // repeated CONNECT probes — failed attempts poison subsequent ones.
-        // Wait for the kernel to boot and agent to start, then verify once.
         info!(
             "waiting for guest agent on vsock (cid={}, timeout={}s)",
             self.cid, self.config.agent_startup_timeout_secs
         );
 
-        // Give the kernel time to boot and the agent to start listening.
-        // The guest boot takes ~1-2s, agent init ~0.5s.
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
-        // Now probe with retries, but use a fresh connection each time
         let deadline = tokio::time::Instant::now()
             + Duration::from_secs(self.config.agent_startup_timeout_secs);
 
+        // Poll aggressively — the guest kernel boots in ~200ms and the
+        // agent starts immediately after. Each probe uses a blocking
+        // CONNECT handshake that returns instantly when the agent is
+        // listening, or returns 0 bytes / error when it's not.
         while tokio::time::Instant::now() < deadline {
             if self.check_agent_health().await.unwrap_or(false) {
                 info!("guest agent is ready (cid={})", self.cid);
                 return Ok(());
             }
-            // Wait between probes to let CH reset its vsock socket state
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
         anyhow::bail!(
@@ -313,44 +314,34 @@ impl VmManager {
 
     /// Check if the guest agent is responding on vsock.
     ///
-    /// Uses std::net blocking I/O with a read timeout. Cloud Hypervisor's
-    /// vsock Unix socket doesn't work reliably with tokio's async epoll.
+    /// Sends a CONNECT handshake to CH's vsock socket and checks
+    /// for an "OK" response from the guest agent.
     async fn check_agent_health(&self) -> Result<bool> {
         if !self.vsock_socket.exists() {
             return Ok(false);
         }
-        let socket_path = self.vsock_socket.clone();
-        let port = cloudhv_common::AGENT_VSOCK_PORT;
 
-        tokio::task::spawn_blocking(move || {
-            use std::io::{Read, Write};
+        let stream = match UnixStream::connect(&self.vsock_socket).await {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        };
 
-            let mut stream = match std::os::unix::net::UnixStream::connect(&socket_path) {
-                Ok(s) => s,
-                Err(_) => return false,
-            };
-            // Set a read timeout so the thread doesn't block forever
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-            let cmd = format!("CONNECT {port}\n");
-            if stream.write_all(cmd.as_bytes()).is_err() {
-                return false;
+        let (mut reader, mut writer) = stream.into_split();
+        let cmd = format!("CONNECT {}\n", cloudhv_common::AGENT_VSOCK_PORT);
+        if writer.write_all(cmd.as_bytes()).await.is_err() {
+            return Ok(false);
+        }
+
+        let mut buf = [0u8; 64];
+        match tokio::time::timeout(Duration::from_secs(2), reader.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                let response = String::from_utf8_lossy(&buf[..n]);
+                Ok(response.starts_with("OK"))
             }
-
-            let mut buf = [0u8; 256];
-            match stream.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    let response = String::from_utf8_lossy(&buf[..n]);
-                    response.starts_with("OK")
-                }
-                _ => false, // Timeout (WouldBlock), EOF, or error
-            }
-        })
-        .await
-        .unwrap_or(false)
-        .then_some(true)
-        .ok_or_else(|| anyhow::anyhow!("agent not ready"))
-        .or(Ok(false))
+            _ => Ok(false),
+        }
     }
 
     /// Send an HTTP request to the Cloud Hypervisor API over Unix socket.
@@ -699,6 +690,41 @@ impl VmManager {
     #[allow(dead_code)]
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
+    }
+}
+
+/// Synchronous cleanup on drop — kills child processes and removes state.
+/// This ensures VM resources are released even if the shim panics or
+/// the async cleanup path is never reached.
+impl Drop for VmManager {
+    fn drop(&mut self) {
+        // Kill child processes synchronously using their PIDs
+        for (name, proc) in [
+            ("cloud-hypervisor", &mut self.ch_process),
+            ("virtiofsd", &mut self.virtiofsd_process),
+            ("swtpm", &mut self.swtpm_process),
+        ] {
+            if let Some(child) = proc.take() {
+                let pid = child.id();
+                if let Some(pid) = pid {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGTERM);
+                    }
+                    debug!("sent SIGTERM to {} (pid={})", name, pid);
+                }
+            }
+        }
+
+        // Remove state directory
+        if self.state_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&self.state_dir) {
+                debug!(
+                    "failed to remove state dir {}: {}",
+                    self.state_dir.display(),
+                    e
+                );
+            }
+        }
     }
 }
 

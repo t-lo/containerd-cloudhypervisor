@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -153,7 +157,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: guest/kernel/vmlinux
-          key: kernel-${{ env.KERNEL_VERSION }}-${{ hashFiles('guest/kernel/configs/microvm.config') }}
+          key: kernel-${{ env.KERNEL_VERSION }}-${{ hashFiles('guest/kernel/configs/microvm.config', 'guest/kernel/build-kernel.sh') }}
 
       - name: Build guest kernel
         if: env.KVM_AVAILABLE == 'true' && steps.kernel-cache.outputs.cache-hit != 'true'
@@ -185,6 +189,10 @@ jobs:
             CLOUDHV_TEST_CH_BIN="/usr/local/bin/cloud-hypervisor" \
             CLOUDHV_TEST_VFSD="/usr/libexec/virtiofsd" \
             cargo test -p containerd-shim-cloudhv --test integration -- --nocapture --test-threads=1
+
+      - name: Fix cargo cache permissions
+        if: always()
+        run: sudo chown -R $(id -u):$(id -g) ~/.cargo/ target/ 2>/dev/null || true
 
       - name: Skip notice
         if: env.KVM_AVAILABLE != 'true'

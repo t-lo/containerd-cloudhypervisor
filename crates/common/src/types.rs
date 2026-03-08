@@ -82,7 +82,7 @@ fn default_agent_timeout() -> u64 {
     crate::AGENT_STARTUP_TIMEOUT_SECS
 }
 fn default_kernel_args() -> String {
-    "console=hvc0 root=/dev/vda rw quiet".to_string()
+    "console=hvc0 root=/dev/vda rw quiet init=/init".to_string()
 }
 fn default_pool_size() -> usize {
     crate::DEFAULT_POOL_SIZE

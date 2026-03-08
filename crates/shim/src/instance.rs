@@ -60,7 +60,7 @@ impl Shim for CloudHvShim {
                 default_memory_mb: cloudhv_common::DEFAULT_MEMORY_MB,
                 vsock_port: cloudhv_common::AGENT_VSOCK_PORT,
                 agent_startup_timeout_secs: cloudhv_common::AGENT_STARTUP_TIMEOUT_SECS,
-                kernel_args: "console=hvc0 root=/dev/vda rw quiet".to_string(),
+                kernel_args: "console=hvc0 root=/dev/vda rw quiet init=/init".to_string(),
                 debug: false,
                 pool_size: 0,
                 max_containers_per_vm: 1,

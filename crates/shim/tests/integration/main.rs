@@ -10,6 +10,7 @@
 //!   CLOUDHV_TEST_CH_BIN  - path to cloud-hypervisor (default: /usr/local/bin/cloud-hypervisor)
 //!   CLOUDHV_TEST_VFSD    - path to virtiofsd (default: /usr/libexec/virtiofsd)
 
+#[cfg(target_os = "linux")]
 mod helpers;
 
 #[cfg(target_os = "linux")]

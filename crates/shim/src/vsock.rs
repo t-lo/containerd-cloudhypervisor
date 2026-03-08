@@ -27,8 +27,7 @@ impl VsockClient {
     }
 
     /// Perform the Cloud Hypervisor vsock CONNECT handshake and return
-    /// the raw connected UnixStream. Includes a timeout to prevent
-    /// hanging if the guest agent isn't ready.
+    /// the connected tokio UnixStream for ttrpc.
     async fn vsock_connect(&self) -> Result<UnixStream> {
         let stream = UnixStream::connect(&self.socket_path)
             .await
@@ -47,18 +46,13 @@ impl VsockClient {
 
         let mut buf_reader = BufReader::new(reader);
         let mut response = String::new();
-
-        // Timeout the read — if the guest agent isn't listening on the
-        // vsock port, this read_line will block forever without a timeout.
         tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(5),
             buf_reader.read_line(&mut response),
         )
         .await
-        .map_err(|_| {
-            anyhow::anyhow!("vsock CONNECT handshake timed out (10s) — agent may not be ready")
-        })?
-        .context("vsock read_line failed")?;
+        .map_err(|_| anyhow::anyhow!("vsock CONNECT handshake timed out"))?
+        .context("vsock read failed")?;
 
         if !response.starts_with("OK") {
             anyhow::bail!("vsock CONNECT failed: {}", response.trim());
@@ -80,7 +74,6 @@ impl VsockClient {
 
         let stream = self.vsock_connect().await?;
 
-        // Wrap the tokio UnixStream into a ttrpc Socket, then create a ttrpc Client
         let socket = ttrpc::r#async::transport::Socket::new(stream);
         let ttrpc_client = ttrpc::r#async::Client::new(socket);
         let agent_client = AgentServiceClient::new(ttrpc_client.clone());
