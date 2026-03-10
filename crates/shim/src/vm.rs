@@ -39,8 +39,11 @@ pub struct VmManager {
     tpm_socket: PathBuf,
     /// Cloud Hypervisor child process.
     ch_process: Option<Child>,
-    /// virtiofsd child process.
+    /// virtiofsd child process (used when embedded-virtiofsd feature is disabled).
     virtiofsd_process: Option<Child>,
+    /// In-process virtiofsd backend (used when embedded-virtiofsd feature is enabled).
+    #[cfg(all(target_os = "linux", feature = "embedded-virtiofsd"))]
+    virtiofsd_backend: Option<crate::virtfs::VirtiofsBackend>,
     /// swtpm child process (if TPM enabled).
     swtpm_process: Option<Child>,
     /// Runtime configuration.
@@ -76,6 +79,8 @@ impl VmManager {
             tpm_socket,
             ch_process: None,
             virtiofsd_process: None,
+            #[cfg(all(target_os = "linux", feature = "embedded-virtiofsd"))]
+            virtiofsd_backend: None,
             swtpm_process: None,
             config,
         })
@@ -120,6 +125,8 @@ impl VmManager {
             tpm_socket,
             ch_process: Some(restored.ch_process),
             virtiofsd_process: None,
+            #[cfg(all(target_os = "linux", feature = "embedded-virtiofsd"))]
+            virtiofsd_backend: None,
             swtpm_process: None,
             config,
         }
@@ -180,20 +187,37 @@ impl VmManager {
     }
 
     /// Start virtiofsd to serve the shared directory.
-    /// Returns immediately after spawning — use `wait_virtiofsd_ready()` to wait.
+    ///
+    /// When the `embedded-virtiofsd` feature is enabled, runs virtiofsd
+    /// in-process as a thread (no child process, ~5MB RSS saved per VM).
+    /// Otherwise, spawns the virtiofsd binary as a child process.
+    ///
+    /// Returns immediately — use `wait_virtiofsd_ready()` to wait for the socket.
     pub fn spawn_virtiofsd(&mut self) -> Result<()> {
-        let child = Command::new(&self.config.virtiofsd_binary)
-            .arg(format!("--socket-path={}", self.virtiofsd_socket.display()))
-            .arg(format!("--shared-dir={}", self.shared_dir.display()))
-            .arg("--cache=never")
-            .arg("--sandbox=none")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("failed to spawn virtiofsd")?;
-        self.virtiofsd_process = Some(child);
-        Ok(())
+        #[cfg(all(target_os = "linux", feature = "embedded-virtiofsd"))]
+        {
+            let backend =
+                crate::virtfs::VirtiofsBackend::start(&self.virtiofsd_socket, &self.shared_dir)
+                    .context("failed to start embedded virtiofsd")?;
+            self.virtiofsd_backend = Some(backend);
+            Ok(())
+        }
+
+        #[cfg(not(all(target_os = "linux", feature = "embedded-virtiofsd")))]
+        {
+            let child = Command::new(&self.config.virtiofsd_binary)
+                .arg(format!("--socket-path={}", self.virtiofsd_socket.display()))
+                .arg(format!("--shared-dir={}", self.shared_dir.display()))
+                .arg("--cache=never")
+                .arg("--sandbox=none")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .context("failed to spawn virtiofsd")?;
+            self.virtiofsd_process = Some(child);
+            Ok(())
+        }
     }
 
     /// Wait for virtiofsd socket to appear.
@@ -628,50 +652,10 @@ impl VmManager {
         Ok(())
     }
 
-    /// Remove a previously hot-plugged disk from the VM.
-    #[allow(dead_code)]
-    pub async fn remove_disk(&self, disk_id: &str) -> Result<()> {
-        let body = format!(r#"{{"id":"{}"}}"#, disk_id);
-        self.api_request("PUT", "/api/v1/vm.remove-device", Some(&body))
-            .await
-            .context("failed to remove disk")?;
-        info!("disk {} removed from VM {}", disk_id, self.vm_id);
-        Ok(())
-    }
-
-    /// Hot-add a virtio-net device backed by a TAP device.
-    ///
-    /// Used to add networking to a snapshot-restored VM (golden snapshots
-    /// exclude network devices). The TAP device must already exist in the
-    /// appropriate network namespace.
-    #[allow(dead_code)]
-    pub async fn add_net(&self, tap_name: &str, mac: Option<&str>) -> Result<()> {
-        let mut net_config = serde_json::json!({
-            "tap": tap_name,
-        });
-        if let Some(m) = mac {
-            net_config["mac"] = serde_json::Value::String(m.to_string());
-        }
-        let body = serde_json::to_string(&net_config)?;
-        info!(
-            "hot-adding net to VM {}: tap={} mac={:?}",
-            self.vm_id, tap_name, mac
-        );
-
-        self.api_request("PUT", "/api/v1/vm.add-net", Some(&body))
-            .await
-            .context("failed to hot-add net device")?;
-
-        info!(
-            "net device hot-added to VM {} (tap={})",
-            self.vm_id, tap_name
-        );
-        Ok(())
-    }
-
-    /// Hot-add a net device to a VM via its API socket (static version).
+    /// Hot-add a virtio-net device to a VM via its API socket.
     ///
     /// Used for snapshot-restored VMs that don't have a VmManager.
+    /// The TAP device must already exist in the appropriate network namespace.
     #[allow(dead_code)]
     pub async fn add_net_to_socket(
         api_socket: &Path,
@@ -757,54 +741,6 @@ impl VmManager {
         Ok(())
     }
 
-    /// Send this VM to another Cloud Hypervisor instance via live migration.
-    ///
-    /// The destination CH must be running and have called receive_migration.
-    /// Transport: "unix:/path/to/socket" for same-host, "tcp:host:port" for remote.
-    #[allow(dead_code)]
-    pub async fn send_migration(&self, transport_uri: &str, local: bool) -> Result<()> {
-        info!("sending VM {} migration to {}", self.vm_id, transport_uri);
-
-        let mut body_map = serde_json::Map::new();
-        body_map.insert(
-            "destination_url".to_string(),
-            serde_json::Value::String(transport_uri.to_string()),
-        );
-        if local {
-            body_map.insert("local".to_string(), serde_json::Value::Bool(true));
-        }
-        let body = serde_json::to_string(&serde_json::Value::Object(body_map))?;
-
-        self.api_request("PUT", "/api/v1/vm.send-migration", Some(&body))
-            .await
-            .context("failed to send migration")?;
-
-        info!("VM {} migration sent to {}", self.vm_id, transport_uri);
-        Ok(())
-    }
-
-    /// Prepare to receive a VM via live migration.
-    #[allow(dead_code)]
-    pub async fn receive_migration(api_socket: &Path, transport_uri: &str) -> Result<()> {
-        info!("preparing to receive migration on {}", transport_uri);
-
-        let body = serde_json::to_string(&serde_json::json!({
-            "receiver_url": transport_uri
-        }))?;
-
-        Self::api_request_to_socket(
-            api_socket,
-            "PUT",
-            "/api/v1/vm.receive-migration",
-            Some(&body),
-        )
-        .await
-        .context("failed to receive migration")?;
-
-        info!("VM migration received on {}", transport_uri);
-        Ok(())
-    }
-
     /// Shutdown the VM gracefully.
     pub async fn shutdown(&mut self) -> Result<()> {
         info!("shutting down VM {}", self.vm_id);
@@ -834,6 +770,13 @@ impl VmManager {
         if let Some(ref mut child) = self.virtiofsd_process {
             let _ = child.kill().await;
             let _ = child.wait().await;
+        }
+
+        // Stop embedded virtiofsd backend (thread exits when CH disconnects,
+        // which we ensured above by killing the CH process).
+        #[cfg(all(target_os = "linux", feature = "embedded-virtiofsd"))]
+        {
+            self.virtiofsd_backend.take();
         }
 
         // Clean up swtpm if running
