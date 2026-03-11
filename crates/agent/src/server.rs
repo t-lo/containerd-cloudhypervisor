@@ -37,8 +37,26 @@ impl AgentService for AgentServiceHandler {
             Some(req.stderr.as_str())
         };
         let mut mgr = self.container_manager.lock().await;
+        let volumes: Vec<crate::container::VolumeInfo> = req
+            .volumes
+            .iter()
+            .map(|v| crate::container::VolumeInfo {
+                destination: v.destination.clone(),
+                source: v.source.clone(),
+                readonly: v.readonly,
+                is_block: v.volume_type
+                    == cloudhv_proto::generated::agent::VolumeType::BLOCK.into(),
+                fs_type: v.fs_type.clone(),
+            })
+            .collect();
         let pid = mgr
-            .create(&req.container_id, &req.bundle_path, stdout, stderr)
+            .create(
+                &req.container_id,
+                &req.bundle_path,
+                stdout,
+                stderr,
+                &volumes,
+            )
             .await
             .map_err(|e| ttrpc::Error::Others(format!("create_container failed: {e:#}")))?;
         let mut resp = CreateContainerResponse::new();
