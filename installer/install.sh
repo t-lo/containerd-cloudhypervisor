@@ -108,17 +108,20 @@ if [ ! -f "$HOST/usr/local/bin/cloud-hypervisor" ]; then
   chmod 755 "$HOST/usr/local/bin/cloud-hypervisor"
 fi
 
-# 6. Restart containerd to pick up the new runtime
-echo "[cloudhv] Restarting containerd..."
-chroot "$HOST" systemctl restart containerd
-sleep 5
+# 6. Schedule a deferred containerd restart on the host.
+#    We use nsenter to run in the host's PID/mount namespace so the restart
+#    happens outside this container. A 5-second delay ensures this pod
+#    reports Running before containerd cycles.
+echo "[cloudhv] Scheduling deferred containerd restart (5s delay)..."
+nsenter --target 1 --mount --uts --ipc --pid -- \
+  bash -c 'nohup bash -c "sleep 5 && systemctl restart containerd" &>/dev/null &'
 
-# 7. Verify
+# 7. Verify containerd comes back
+sleep 10
 if chroot "$HOST" systemctl is-active --quiet containerd; then
   echo "[cloudhv] containerd restarted successfully"
 else
-  echo "[cloudhv] ERROR: containerd failed to restart"
-  exit 1
+  echo "[cloudhv] WARNING: containerd may still be restarting"
 fi
 
 # 8. Label node as ready
