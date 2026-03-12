@@ -48,7 +48,6 @@ struct SharedVmState {
     vm: VmManager,
     agent: cloudhv_proto::AgentServiceClient,
     shared_dir: PathBuf,
-    ch_pid: u32,
     container_count: AtomicUsize,
     api_socket: PathBuf,
 }
@@ -187,7 +186,6 @@ impl Instance for CloudHvInstance {
 impl CloudHvInstance {
     /// Boot a VM for the sandbox container.
     async fn start_sandbox(&self) -> Result<u32, Error> {
-        let bundle_path = self.bundle.to_string_lossy().to_string();
         let sandbox_id = self.id.clone();
 
         let spec_path = self.bundle.join("config.json");
@@ -283,7 +281,6 @@ impl CloudHvInstance {
             vm,
             agent,
             shared_dir,
-            ch_pid,
             container_count: AtomicUsize::new(1), // sandbox itself counts
             api_socket,
         });
@@ -375,7 +372,7 @@ impl CloudHvInstance {
         let bundle_guest = format!("/run/containers/{}", container_id);
 
         // Send CreateContainer RPC to the guest agent
-        let create_resp = {
+        {
             let mut create_req = cloudhv_proto::CreateContainerRequest::new();
             create_req.container_id = container_id.to_string();
             create_req.bundle_path = bundle_guest;
@@ -591,66 +588,6 @@ fn dir_size(path: &std::path::Path) -> anyhow::Result<u64> {
     Ok(total)
 }
 
-/// Forward container output from a shared dir file to a containerd FIFO.
-///
-/// The agent writes crun's stdout/stderr to files in the virtio-fs shared
-/// directory. This task tails the file and writes to containerd's FIFO so
-/// that `crictl logs` and `kubectl logs` work.
-#[allow(dead_code)]
-async fn forward_output(src: std::path::PathBuf, dst: String) {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    // Wait for the source file to appear (agent creates it on start)
-    for _ in 0..100 {
-        if src.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    let src_file = match tokio::fs::File::open(&src).await {
-        Ok(f) => f,
-        Err(e) => {
-            info!("I/O forward: can't open source {}: {e}", src.display());
-            return;
-        }
-    };
-
-    // Open the containerd FIFO for writing (this blocks until a reader connects)
-    let dst_file = match tokio::fs::OpenOptions::new().write(true).open(&dst).await {
-        Ok(f) => f,
-        Err(e) => {
-            info!("I/O forward: can't open FIFO {}: {e}", dst);
-            return;
-        }
-    };
-
-    let mut reader = BufReader::new(src_file);
-    let mut writer = dst_file;
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => {
-                // EOF — file may still be written to, poll
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                // Check if source file has grown
-                match tokio::fs::metadata(&src).await {
-                    Ok(_) => continue,
-                    Err(_) => break, // File removed, stop
-                }
-            }
-            Ok(_) => {
-                if writer.write_all(line.as_bytes()).await.is_err() {
-                    break; // FIFO reader disconnected
-                }
-            }
-            Err(_) => break,
-        }
-    }
-}
-
 /// Information about a TAP device created for VM networking.
 struct TapInfo {
     tap_name: String,
@@ -831,180 +768,4 @@ fn prefix_to_netmask(prefix: u32) -> String {
         (mask >> 8) & 0xff,
         mask & 0xff,
     )
-}
-
-/// Extract volume mounts from the OCI spec and stage them for the guest.
-///
-/// Dual-path transport:
-/// - **Block devices** (raw block PVCs): hot-plugged via vm.add-disk for
-///   direct virtio-blk access (no FUSE overhead)
-/// - **Filesystem volumes** (ConfigMaps, Secrets, emptyDirs, fs PVCs):
-///   bind-mounted into the virtio-fs shared dir for live host access
-#[allow(dead_code)]
-fn extract_and_stage_volumes(
-    spec_path: &std::path::Path,
-    container_id: &str,
-    shared_dir: &std::path::Path,
-) -> Vec<cloudhv_proto::VolumeMount> {
-    let data = match std::fs::read_to_string(spec_path) {
-        Ok(d) => d,
-        Err(_) => return vec![],
-    };
-    let spec: serde_json::Value = match serde_json::from_str(&data) {
-        Ok(s) => s,
-        Err(_) => return vec![],
-    };
-
-    let mounts = match spec.get("mounts").and_then(|m| m.as_array()) {
-        Some(m) => m,
-        None => return vec![],
-    };
-
-    let skip_destinations = [
-        "/proc",
-        "/dev",
-        "/dev/pts",
-        "/dev/shm",
-        "/dev/mqueue",
-        "/sys",
-        "/sys/fs/cgroup",
-        "/etc/hostname",
-        "/etc/hosts",
-        "/etc/resolv.conf",
-        "/dev/termination-log",
-    ];
-
-    let mut volumes = Vec::new();
-
-    for mount in mounts {
-        let dest = match mount.get("destination").and_then(|d| d.as_str()) {
-            Some(d) => d,
-            None => continue,
-        };
-        let source = match mount.get("source").and_then(|s| s.as_str()) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        if skip_destinations.contains(&dest) || dest.starts_with("/var/run/secrets") {
-            continue;
-        }
-
-        let src_path = std::path::Path::new(source);
-        if !src_path.exists() {
-            continue;
-        }
-
-        let options = mount
-            .get("options")
-            .and_then(|o| o.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-            .unwrap_or_default();
-        let readonly = options.contains(&"ro");
-
-        // Detect block devices vs filesystem paths
-        if is_block_device(src_path) {
-            // Block device — will be hot-plugged via vm.add-disk.
-            // The agent discovers it as a new /dev/vdX and mounts it.
-            let mut vol_msg = cloudhv_proto::VolumeMount::new();
-            vol_msg.destination = dest.to_string();
-            vol_msg.source = source.to_string();
-            vol_msg.readonly = readonly;
-            vol_msg.volume_type = cloudhv_proto::VolumeType::BLOCK.into();
-            vol_msg.fs_type = detect_fs_type(source).unwrap_or_else(|| "ext4".to_string());
-            vol_msg.options = options.iter().map(|s| s.to_string()).collect();
-            log::info!(
-                "block volume: {} -> {} (fs={})",
-                source,
-                dest,
-                vol_msg.fs_type
-            );
-            volumes.push(vol_msg);
-        } else {
-            // Filesystem path — bind-mount into the shared directory so
-            // the guest sees a live view via virtio-fs.
-            let mount_type = mount.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let is_bind =
-                mount_type == "bind" || options.iter().any(|o| *o == "bind" || *o == "rbind");
-            if !is_bind {
-                continue;
-            }
-
-            let safe_dest = dest.trim_start_matches('/').replace('/', "_");
-            let vol_dir = shared_dir
-                .join("volumes")
-                .join(container_id)
-                .join(&safe_dest);
-
-            if let Err(e) = bind_mount_volume(src_path, &vol_dir) {
-                log::warn!(
-                    "failed to bind-mount volume {} -> {}: {e}",
-                    source,
-                    vol_dir.display()
-                );
-                continue;
-            }
-
-            let guest_source = format!(
-                "{}/volumes/{}/{}",
-                cloudhv_common::VIRTIOFS_GUEST_MOUNT,
-                container_id,
-                safe_dest
-            );
-
-            let mut vol_msg = cloudhv_proto::VolumeMount::new();
-            vol_msg.destination = dest.to_string();
-            vol_msg.source = guest_source;
-            vol_msg.readonly = readonly;
-            vol_msg.volume_type = cloudhv_proto::VolumeType::FILESYSTEM.into();
-            vol_msg.options = options.iter().map(|s| s.to_string()).collect();
-            volumes.push(vol_msg);
-            log::info!("fs volume: {} -> {} (ro={})", source, dest, readonly);
-        }
-    }
-
-    volumes
-}
-
-/// Check if a path is a block device.
-#[allow(dead_code)]
-fn is_block_device(path: &std::path::Path) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    match std::fs::metadata(path) {
-        Ok(meta) => meta.file_type().is_block_device(),
-        Err(_) => false,
-    }
-}
-
-/// Detect the filesystem type of a block device via blkid.
-#[allow(dead_code)]
-fn detect_fs_type(device: &str) -> Option<String> {
-    let output = std::process::Command::new("blkid")
-        .args(["-s", "TYPE", "-o", "value", device])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        let fs = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !fs.is_empty() {
-            return Some(fs);
-        }
-    }
-    None
-}
-
-/// Bind-mount a host path into the shared directory.
-#[allow(dead_code)]
-fn bind_mount_volume(source: &std::path::Path, target: &std::path::Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(target)?;
-    let status = std::process::Command::new("mount")
-        .args([
-            "--bind",
-            &source.to_string_lossy(),
-            &target.to_string_lossy(),
-        ])
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("mount --bind failed: {status}");
-    }
-    Ok(())
 }

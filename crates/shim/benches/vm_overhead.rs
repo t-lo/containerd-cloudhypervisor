@@ -1,10 +1,9 @@
 //! Benchmarks for containerd-cloudhypervisor overhead measurements.
 //!
 //! Measures:
-//! - Image layer cache operations (in-memory, no I/O)
 //! - VM config serialization overhead
 //! - CID allocation throughput
-//! - Pool acquire/release cycle (in-memory)
+//! - Hypervisor detection
 //!
 //! Run with: cargo bench -p containerd-shim-cloudhv
 //!
@@ -14,60 +13,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 use cloudhv_common::types::*;
-use containerd_shim_cloudhv::image_cache::ImageLayerCache;
-
-/// Benchmark image layer cache operations (pure in-memory + filesystem).
-fn bench_image_cache(c: &mut Criterion) {
-    let mut group = c.benchmark_group("image_cache");
-
-    group.bench_function("ensure_layer_new", |b| {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cache = ImageLayerCache::new(dir.path().to_path_buf());
-        let mut i = 0u64;
-        b.iter(|| {
-            let digest = format!("sha256:{:064x}", i);
-            i += 1;
-            black_box(cache.ensure_layer(&digest).unwrap());
-        });
-    });
-
-    group.bench_function("ensure_layer_cached", |b| {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cache = ImageLayerCache::new(dir.path().to_path_buf());
-        cache.ensure_layer("sha256:cached_layer").unwrap();
-        b.iter(|| {
-            black_box(cache.ensure_layer("sha256:cached_layer").unwrap());
-        });
-    });
-
-    group.bench_function("release_layer", |b| {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cache = ImageLayerCache::new(dir.path().to_path_buf());
-        // Pre-fill with high refcount
-        for _ in 0..1000 {
-            cache.ensure_layer("sha256:release_test").unwrap();
-        }
-        b.iter(|| {
-            cache.release_layer(black_box("sha256:release_test"));
-        });
-    });
-
-    group.bench_function("is_cached_lookup", |b| {
-        let dir = tempfile::tempdir().unwrap();
-        let mut cache = ImageLayerCache::new(dir.path().to_path_buf());
-        for i in 0..100 {
-            cache.ensure_layer(&format!("sha256:layer_{i}")).unwrap();
-        }
-        let mut i = 0;
-        b.iter(|| {
-            let digest = format!("sha256:layer_{}", i % 100);
-            i += 1;
-            black_box(cache.is_cached(&digest));
-        });
-    });
-
-    group.finish();
-}
 
 /// Benchmark VM config JSON serialization (measures shim overhead per create).
 fn bench_vm_config_serialization(c: &mut Criterion) {
@@ -204,7 +149,6 @@ fn bench_hypervisor_detection(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_image_cache,
     bench_vm_config_serialization,
     bench_cid_allocation,
     bench_hypervisor_detection,

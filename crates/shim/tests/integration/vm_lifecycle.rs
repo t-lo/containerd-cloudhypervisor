@@ -580,8 +580,7 @@ fn test_container_logs_captured() {
         vm.wait_for_agent().await.expect("agent");
 
         // ── Connect ttrpc agent ───────────────────────────────────────
-        let vsock_client =
-            containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket().to_path_buf());
+        let vsock_client = containerd_shim_cloudhv::vsock::VsockClient::new(vm.vsock_socket());
         let (agent, _health) = vsock_client.connect_ttrpc().await.expect("ttrpc");
 
         // ── Create I/O directory on host (shared via virtio-fs) ───────

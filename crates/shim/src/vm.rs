@@ -468,71 +468,6 @@ impl VmManager {
         Self::api_request_to_socket(&self.api_socket, method, path, body).await
     }
 
-    /// Resize VM resources (vCPUs and/or memory) via the CH API.
-    ///
-    /// Uses PUT /api/v1/vm.resize to dynamically adjust resources.
-    /// Only works if the VM was created with hotplug_size > 0.
-    #[allow(dead_code)]
-    pub async fn resize(
-        &self,
-        desired_vcpus: Option<u32>,
-        desired_memory_bytes: Option<u64>,
-    ) -> Result<()> {
-        let mut resize_body = serde_json::Map::new();
-        if let Some(vcpus) = desired_vcpus {
-            resize_body.insert(
-                "desired_vcpus".to_string(),
-                serde_json::Value::Number(vcpus.into()),
-            );
-        }
-        if let Some(mem) = desired_memory_bytes {
-            resize_body.insert(
-                "desired_ram".to_string(),
-                serde_json::Value::Number(mem.into()),
-            );
-        }
-
-        if resize_body.is_empty() {
-            return Ok(());
-        }
-
-        let body = serde_json::to_string(&serde_json::Value::Object(resize_body))?;
-        info!("resizing VM {}: {}", self.vm_id, body);
-
-        self.api_request("PUT", "/api/v1/vm.resize", Some(&body))
-            .await
-            .context("failed to resize VM")?;
-
-        info!("VM {} resized successfully", self.vm_id);
-        Ok(())
-    }
-
-    /// Hot-plug a virtio-blk disk into the running VM.
-    ///
-    /// Used to deliver container rootfs as block devices. The guest kernel
-    /// detects the new disk via ACPI hot-plug and it appears as /dev/vdX.
-    /// Returns the disk ID for later removal.
-    #[allow(dead_code)]
-    pub async fn add_disk(&self, path: &str, disk_id: &str, readonly: bool) -> Result<()> {
-        let disk = VmDisk {
-            path: path.to_string(),
-            readonly,
-            id: Some(disk_id.to_string()),
-        };
-        let body = serde_json::to_string(&disk)?;
-        info!(
-            "hot-plugging disk to VM {}: id={} path={}",
-            self.vm_id, disk_id, path
-        );
-
-        self.api_request("PUT", "/api/v1/vm.add-disk", Some(&body))
-            .await
-            .context("failed to hot-plug disk")?;
-
-        info!("disk {} hot-plugged to VM {}", disk_id, self.vm_id);
-        Ok(())
-    }
-
     /// Shutdown the VM gracefully.
     pub async fn shutdown(&mut self) -> Result<()> {
         info!("shutting down VM {}", self.vm_id);
@@ -606,11 +541,6 @@ impl VmManager {
         &self.vm_id
     }
 
-    #[allow(dead_code)]
-    pub fn cid(&self) -> u64 {
-        self.cid
-    }
-
     pub fn vsock_socket(&self) -> &Path {
         &self.vsock_socket
     }
@@ -619,8 +549,16 @@ impl VmManager {
         &self.shared_dir
     }
 
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
     pub fn api_socket_path(&self) -> &Path {
         &self.api_socket
+    }
+
+    pub fn cid(&self) -> u64 {
+        self.cid
     }
 
     /// Append extra parameters to the kernel command line.
@@ -633,9 +571,54 @@ impl VmManager {
         self.ch_process.as_ref().and_then(|c| c.id())
     }
 
-    #[allow(dead_code)]
-    pub fn state_dir(&self) -> &Path {
-        &self.state_dir
+    /// Hot-plug a block device into the VM.
+    pub async fn add_disk(&self, path: &str, disk_id: &str, readonly: bool) -> Result<()> {
+        let disk = VmDisk {
+            path: path.to_string(),
+            readonly,
+            id: Some(disk_id.to_string()),
+        };
+        let body = serde_json::to_string(&disk)?;
+        info!(
+            "hot-plugging disk to VM {}: id={} path={}",
+            self.vm_id, disk_id, path
+        );
+        self.api_request("PUT", "/api/v1/vm.add-disk", Some(&body))
+            .await
+            .context("failed to hot-plug disk")?;
+        info!("disk {} hot-plugged to VM {}", disk_id, self.vm_id);
+        Ok(())
+    }
+
+    /// Resize the VM's vCPUs and/or memory.
+    pub async fn resize(
+        &self,
+        desired_vcpus: Option<u32>,
+        desired_memory_bytes: Option<u64>,
+    ) -> Result<()> {
+        let mut resize_body = serde_json::Map::new();
+        if let Some(vcpus) = desired_vcpus {
+            resize_body.insert(
+                "desired_vcpus".to_string(),
+                serde_json::Value::Number(vcpus.into()),
+            );
+        }
+        if let Some(mem) = desired_memory_bytes {
+            resize_body.insert(
+                "desired_ram".to_string(),
+                serde_json::Value::Number(mem.into()),
+            );
+        }
+        if resize_body.is_empty() {
+            return Ok(());
+        }
+        let body = serde_json::to_string(&serde_json::Value::Object(resize_body))?;
+        info!("resizing VM {}: {}", self.vm_id, body);
+        self.api_request("PUT", "/api/v1/vm.resize", Some(&body))
+            .await
+            .context("failed to resize VM")?;
+        info!("VM {} resized successfully", self.vm_id);
+        Ok(())
     }
 }
 
