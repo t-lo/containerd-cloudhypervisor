@@ -13,29 +13,7 @@ Scripts are meant to be called from the repository root.
   - will put static `mkfs.erofs` into the repo root.
 * `hacks/build-sysext.sh` - Will build a system extension image with guest (L2) and host bits, including host configuration.
   - will put `containerd-cloudhypervisor.raw` into the repo root.
-
-## Using the sysext image
-
-The easiest way to test the sysext image is to leverage the [`boot` feature](https://github.com/flatcar/sysext-bakery?tab=readme-ov-file#interactively-test-extension-images-in-a-local-vm)
-of Flatcar's [sysext bakery](https://github.com/flatcar/sysext-bakery).
-
-1. Check out the bakery repo into a separate directory:
-   ```
-   git clone --depth 1 https://github.com/flatcar/sysext-bakery.git
-   ```
-2. Copy `containerd-cloudhypervisor.raw` into the bakery repo root
-3. Run
-   ```
-   ./bakery.sh boot containerd-cloudhypervisor.raw
-   ```
-
-This will download the latest Flatcar Alpha release for qemu, then start a Flatcar VM in ephemeral mode (no changes will be persisted in the image).
-`bakery.sh boot` will also launch a local Python webserver and generate transient Ignition configuration to provision `containerd-cloudhypervisor.raw` at boot time.
-
-After the VM boot finished, run the demo included with the extension image to verify:
-```
-sudo /usr/share/cloudhv/demo/demo.sh
-```
+    See [main readme](../README.md#test-your-builds-locally-in-a-flatcar-vm) for usage instructions.
 
 ## Building for different architectures
 
