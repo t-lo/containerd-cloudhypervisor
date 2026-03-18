@@ -154,6 +154,34 @@ jobs:
           name: ${{ matrix.rootfs_artifact }}
           path: guest/rootfs/rootfs.erofs
 
+  build-sysext:
+    # FIXME: the below will-rebuild everything instead of re-using the above build artifacts.
+    #        We should eventually simplify the above build in the same way as ci.yaml, and build + upload everything in one job.
+    name: System Extension Image for (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            sysext_arch: x86-64
+            runner: ubuntu-latest
+          - arch: aarch64
+            sysext_arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build extension image
+        run: |
+          hacks/build-sysext.sh
+          mv containerd-cloudhypervisor.raw containerd-cloudhypervisor-${{ github.ref_name }}-${{ matrix.sysext_arch }}.raw
+
+      - name: Upload rootfs
+        uses: actions/upload-artifact@v4
+        with:
+          name: containerd-cloudhypervisor-${{ github.ref_name }}-${{ matrix.sysext_arch }}.raw
+          path: containerd-cloudhypervisor-${{ github.ref_name }}-${{ matrix.sysext_arch }}.raw
+
   build-installer-image:
     name: Build Installer Image
     runs-on: ubuntu-latest
