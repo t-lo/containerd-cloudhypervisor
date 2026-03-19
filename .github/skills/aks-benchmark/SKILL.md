@@ -1,5 +1,5 @@
 ---
-name: "AKS Benchmark: CloudHV vs Kata"
+name: aks-benchmark
 description: |
   Runs a 150-pod scale benchmark comparing containerd-cloudhypervisor against
   Kata Containers (AKS pod sandboxing) on identical AKS infrastructure.
