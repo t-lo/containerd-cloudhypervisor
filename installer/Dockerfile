@@ -8,7 +8,7 @@
 # version once CH >= v51 is published.
 
 # --- Stage 1: Build Cloud Hypervisor from source ---
-FROM rust:1.86-bookworm AS ch-builder
+FROM rust:1.89-bookworm AS ch-builder
 
 ARG TARGETARCH
 ARG CH_REPO=https://github.com/cloud-hypervisor/cloud-hypervisor.git
