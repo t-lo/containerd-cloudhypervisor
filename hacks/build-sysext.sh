@@ -24,24 +24,33 @@ build() {
   cp -a /host/* .
 
   build_if_missing "$host_user_group" /host/hacks/build-guest.sh -- vmlinux vmlinux.kconfig rootfs.erofs
-  build_if_missing "$host_user_group" /host/hacks/build-static-rust.sh containerd-shim-cloudhv -- containerd-shim-cloudhv-v1
-  build_if_missing "$host_user_group" /host/hacks/build-static-rust.sh cloudhv-sandbox-daemon -- cloudhv-sandbox-daemon
   build_if_missing "$host_user_group" /host/hacks/build-host-deps.sh -- mkfs.erofs
+  build_if_missing "$host_user_group" /host/hacks/build-host.sh -- containerd-shim-cloudhv-v1 cloudhv-sandbox-daemon
 
-  cd sysext
-  mkdir -p root/usr/bin \
-           root/usr/share/cloudhv/guest \
-           root/usr/libexec/cni
+  cd installer
 
-  cp /host/vmlinux /host/vmlinux.kconfig /host/rootfs.erofs root/usr/share/cloudhv/guest/
+  cp -a root.common/* root.sysext
+
+  mkdir -p root.sysext/usr/bin \
+           root.sysext/usr/share/cloudhv/guest \
+           root.sysext/usr/libexec/cni
+
+  cp sysext-tmpfiles.conf \
+           root.sysext/usr/lib/tmpfiles.d/10-containerd-cloudhypervisor.conf
+
+  cp /host/vmlinux \
+     /host/vmlinux.kconfig \
+     /host/rootfs.erofs \
+           root.sysext/usr/share/cloudhv/guest/
+
   cp /host/containerd-shim-cloudhv-v1 \
      /host/cloudhv-sandbox-daemon \
      /host/mkfs.erofs \
-        root/usr/bin
+           root.sysext/usr/bin/
 
   local arch="$(translate_arch)"
   sed -i "s/^ARCHITECTURE=.*/ARCHITECTURE=${arch}/" \
-      root/usr/lib/extension-release.d/extension-release.containerd-cloudhypervisor
+      root.sysext/usr/lib/extension-release.d/extension-release.containerd-cloudhypervisor
 
   # CNI plugins
   local cni_arch="${arch}"
@@ -50,7 +59,7 @@ build() {
   fi
   wget \
     "https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-${cni_arch}-${CNI_VERSION}.tgz"
-  tar -C root/usr/libexec/cni -xzf "cni-plugins-linux-${cni_arch}-${CNI_VERSION}.tgz"
+  tar -C root.sysext/usr/libexec/cni -xzf "cni-plugins-linux-${cni_arch}-${CNI_VERSION}.tgz"
 
   # Cloud hypervisor
   local ch_sufx=""
@@ -58,10 +67,10 @@ build() {
     ch_sufx="-aarch64"
   fi
   wget "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static${ch_sufx}" \
-    -O root/usr/bin/cloud-hypervisor
-  chmod 755 root/usr/bin/cloud-hypervisor
+    -O root.sysext/usr/bin/cloud-hypervisor
+  chmod 755 root.sysext/usr/bin/cloud-hypervisor
 
-  mkfs.erofs --all-root --exclude-regex '.*\.gitkeep' containerd-cloudhypervisor.raw root
+  mkfs.erofs --all-root --exclude-regex '.*\.gitkeep' containerd-cloudhypervisor.raw root.sysext
   cp containerd-cloudhypervisor.raw /host
   chown "$host_user_group" /host/containerd-cloudhypervisor.raw
 }

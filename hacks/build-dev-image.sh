@@ -66,7 +66,9 @@ if [ -n "$REMOTE" ]; then
   echo ""
 
   echo "==> Step 2: Building static shim and daemon (force rebuild)..."
-  ssh "$REMOTE" "cd ~/containerd-cloudhypervisor && rm -f containerd-shim-cloudhv-v1 cloudhv-sandbox-daemon && bash hacks/build-static-rust.sh containerd-shim-cloudhv cloudhv-sandbox-daemon" 2>&1 | tail -5
+  ssh "$REMOTE" cd "~/containerd-cloudhypervisor" \
+                  && rm -f containerd-shim-cloudhv-v1 cloudhv-sandbox-daemon \
+                  && bash hacks/build-host.sh 2>&1 | tail -5
   echo ""
 
   echo "==> Step 3: Verifying shim architecture..."
@@ -79,7 +81,8 @@ if [ -n "$REMOTE" ]; then
   echo ""
 
   echo "==> Step 4: Building guest (kernel + rootfs)..."
-  ssh "$REMOTE" "cd ~/containerd-cloudhypervisor && bash hacks/build-guest.sh" 2>&1 | tail -5
+  ssh "$REMOTE" cd "~/containerd-cloudhypervisor" \
+                  && bash hacks/build-guest.sh 2>&1 | tail -5
   echo ""
 
   echo "==> Step 5: Building and pushing Docker image..."

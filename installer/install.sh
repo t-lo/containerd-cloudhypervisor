@@ -20,33 +20,6 @@ esac
 
 echo "[cloudhv] Installing on $(cat /host/etc/hostname) (${HOST_ARCH})..."
 
-# 1. Ensure tc (traffic control) is available for VM TAP networking
-if ! nsenter --target 1 --mount -- sh -c 'command -v tc' >/dev/null 2>&1; then
-  echo "[cloudhv] tc not found, installing iproute-tc..."
-  cat > "$HOST/tmp/cloudhv-install-tc.sh" << 'TCEOF'
-#!/bin/sh
-if command -v tdnf >/dev/null 2>&1; then
-  tdnf install -y iproute-tc
-elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y iproute-tc
-elif command -v apt-get >/dev/null 2>&1; then
-  apt-get update -qq && apt-get install -y iproute2
-else
-  echo "No supported package manager found" >&2
-  exit 1
-fi
-TCEOF
-  chmod +x "$HOST/tmp/cloudhv-install-tc.sh"
-  if nsenter --target 1 --mount --uts --ipc --pid -- /tmp/cloudhv-install-tc.sh 2>&1 | tail -5; then
-    echo "[cloudhv] iproute-tc installed"
-  else
-    echo "[cloudhv] ERROR: tc is required but could not be installed"
-    rm -f "$HOST/tmp/cloudhv-install-tc.sh"
-    exit 1
-  fi
-  rm -f "$HOST/tmp/cloudhv-install-tc.sh"
-fi
-
 # 2. Load erofs kernel module and install erofs-utils
 nsenter --target 1 --mount -- modprobe erofs 2>/dev/null || true
 if ! nsenter --target 1 --mount -- sh -c 'command -v mkfs.erofs' >/dev/null 2>&1; then
